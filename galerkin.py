@@ -76,7 +76,11 @@ class FunctionSpace:
         return P
 
     def eval_derivative_basis_function_all(self, Xj, k=1):
-        raise NotImplementedError
+        Xj = np.atleast_1d(Xj)
+        P = np.zeros((len(Xj), self.N + 1))
+        for j in range(self.N + 1):
+            P[:, j] = self.evaluate_derivative_basis_function(Xj, j, k=k)
+        return P
 
     def inner_product(self, u):
         us = map_expression_true_domain(u, x, self.domain, self.reference_domain)
@@ -101,6 +105,10 @@ class Legendre(FunctionSpace):
     def __init__(self, N, domain=(-1, 1)):
         FunctionSpace.__init__(self, N, domain=domain)
 
+    @property
+    def reference_domain(self):
+        return (-1, 1)
+
     def basis_function(self, j, sympy=False):
         if sympy:
             return sp.legendre(j, x)
@@ -110,10 +118,15 @@ class Legendre(FunctionSpace):
         return self.basis_function(j).deriv(k)
 
     def L2_norm_sq(self, N):
-        raise NotImplementedError
+        # Return the L2 norm squared of Legendre polynomials on [-1,1]:
+        # \int_{-1}^1 P_j(x)^2 dx = 2 / (2 j + 1)
+        return np.array([2.0 / (2 * i + 1) for i in range(N)])
 
     def mass_matrix(self):
-        raise NotImplementedError
+        # Construct diagonal mass matrix on the reference domain using
+        # the analytic L2 norms of Legendre polynomials.
+        vals = self.L2_norm_sq(self.N + 1)
+        return sparse.diags([vals], [0], shape=(self.N + 1, self.N + 1), format="csr")
 
     def eval(self, uh, xj):
         xj = np.atleast_1d(xj)
@@ -125,25 +138,44 @@ class Chebyshev(FunctionSpace):
     def __init__(self, N, domain=(-1, 1)):
         FunctionSpace.__init__(self, N, domain=domain)
 
+    @property
+    def reference_domain(self):
+        return (-1, 1)
+
     def basis_function(self, j, sympy=False):
         if sympy:
             return sp.cos(j * sp.acos(x))
         return Cheb.basis(j)
 
     def derivative_basis_function(self, j, k=1):
-        raise NotImplementedError
+        return self.basis_function(j).deriv(k)
 
     def weight(self, x=x):
         return 1 / sp.sqrt(1 - x**2)
 
     def L2_norm_sq(self, N):
-        raise NotImplementedError
+        # For Chebyshev polynomials T_j with weight w(x)=1/sqrt(1-x^2) on [-1,1]:
+        # \int_{-1}^1 T_0(x)^2 w(x) dx = pi,
+        # \int_{-1}^1 T_j(x)^2 w(x) dx = pi/2 for j >= 1
+        if N <= 0:
+            return np.array([])
+        arr = np.empty(N)
+        arr[0] = np.pi
+        if N > 1:
+            arr[1:] = np.pi / 2.0
+        return arr
 
     def mass_matrix(self):
-        raise NotImplementedError
+        # Construct diagonal mass matrix on the reference domain using
+        # the analytic L2 norms of Chebyshev polynomials with weight
+        # w(x)=1/sqrt(1-x^2).
+        vals = self.L2_norm_sq(self.N + 1)
+        return sparse.diags([vals], [0], shape=(self.N + 1, self.N + 1), format="csr")
 
     def eval(self, uh, xj):
-        raise NotImplementedError
+        xj = np.atleast_1d(xj)
+        Xj = map_reference_domain(xj, self.domain, self.reference_domain)
+        return np.polynomial.chebyshev.chebval(Xj, uh)
 
     def inner_product(self, u):
         us = map_expression_true_domain(u, x, self.domain, self.reference_domain)
@@ -208,16 +240,33 @@ class Sines(Trigonometric):
 
 class Cosines(Trigonometric):
     def __init__(self, N, domain=(0, 1), bc=(0, 0)):
-        raise NotImplementedError
+        Trigonometric.__init__(self, N, domain=domain)
+        # Cosine basis matches Neumann boundary conditions (derivative specified)
+        self.B = Neumann(bc, domain, self.reference_domain)
 
     def basis_function(self, j, sympy=False):
-        raise NotImplementedError
+        if sympy:
+            return sp.cos(j * sp.pi * x)
+        return lambda Xj: np.cos(j * np.pi * Xj)
 
     def derivative_basis_function(self, j, k=1):
-        raise NotImplementedError
+        # derivative of cos(j*pi*x) = (j*pi)^k * cos or sin with alternating signs
+        scale = (j * np.pi) ** k * {0: 1, 1: -1}[(k // 2) % 2]
+        if k % 2 == 0:
+            return lambda Xj: scale * np.cos(j * np.pi * Xj)
+        else:
+            # odd derivatives introduce a negative sign compared to sin pattern
+            return lambda Xj: -scale * np.sin(j * np.pi * Xj)
 
     def L2_norm_sq(self, N):
-        raise NotImplementedError
+        # On (0,1): \int_0^1 cos(0)^2 dx = 1, and for j>=1 \int_0^1 cos(j pi x)^2 dx = 1/2
+        if N <= 0:
+            return np.array([])
+        arr = np.empty(N)
+        arr[0] = 1.0
+        if N > 1:
+            arr[1:] = 0.5
+        return arr
 
 
 # Create classes to hold the boundary function
@@ -296,6 +345,47 @@ class Composite(FunctionSpace):
         )
         return self.S @ M @ self.S.T
 
+    def derivative_basis_function(self, j, k=1):
+        """Evaluate k-th derivative of composite basis psi_j = sum_l S_{j,l} Q_l.
+
+        This constructs a numeric evaluator by summing the k-th derivatives
+        of the underlying orthogonal polynomials Q_l multiplied by the
+        stencil coefficients S_{j,l}.
+        """
+        row = self.S.getrow(j).tocoo()
+        cols = row.col
+        data = row.data
+
+        # If composite built from Legendre
+        if issubclass(self.__class__, Legendre) or isinstance(self, Legendre):
+            def psi_deriv(Xj):
+                Xj = np.atleast_1d(Xj)
+                val = np.zeros_like(Xj, dtype=float)
+                for col, coeff in zip(cols, data):
+                    c = np.zeros(col + 1)
+                    c[col] = 1.0
+                    dc = np.polynomial.legendre.legder(c, m=k)
+                    val = val + coeff * np.polynomial.legendre.legval(Xj, dc)
+                return val
+
+            return psi_deriv
+
+        # If composite built from Chebyshev
+        if issubclass(self.__class__, Chebyshev) or isinstance(self, Chebyshev):
+            def psi_deriv(Xj):
+                Xj = np.atleast_1d(Xj)
+                val = np.zeros_like(Xj, dtype=float)
+                for col, coeff in zip(cols, data):
+                    c = np.zeros(col + 1)
+                    c[col] = 1.0
+                    dc = np.polynomial.chebyshev.chebder(c, m=k)
+                    val = val + coeff * np.polynomial.chebyshev.chebval(Xj, dc)
+                return val
+
+            return psi_deriv
+
+        raise RuntimeError("Composite basis must be built from Legendre or Chebyshev")
+
 
 class DirichletLegendre(Composite, Legendre):
     def __init__(self, N, domain=(-1, 1), bc=(0, 0)):
@@ -304,15 +394,32 @@ class DirichletLegendre(Composite, Legendre):
         self.S = sparse.diags((1, -1), (0, 2), shape=(N + 1, N + 3), format="csr")
 
     def basis_function(self, j, sympy=False):
-        raise NotImplementedError
+        if sympy:
+            return sp.legendre(j, x) - sp.legendre(j + 2, x)
+        # numpy.polynomial.Legendre.basis returns a callable-like object
+        Pj = Leg.basis(j)
+        Pj2 = Leg.basis(j + 2)
+        return lambda Xj: Pj(Xj) - Pj2(Xj)
 
 
 class NeumannLegendre(Composite, Legendre):
     def __init__(self, N, domain=(-1, 1), bc=(0, 0), constraint=0):
-        raise NotImplementedError
+        # Build Legendre-based composite space satisfying Neumann BCs.
+        Legendre.__init__(self, N, domain=domain)
+        self.B = Neumann(bc, domain, self.reference_domain)
+        # Use symmetric stencil similar to NeumannChebyshev:
+        # psi_i = Q_{i+1} - Q_{i-1} (missing terms treated as zero)
+        self.S = sparse.diags((-1, 1), (-1, 1), shape=(N + 1, N + 3), format="csr")
 
     def basis_function(self, j, sympy=False):
-        raise NotImplementedError
+        # psi_j = P_{j+1} - P_{j-1}
+        if sympy:
+            return sp.legendre(j + 1, x) - sp.legendre(j - 1, x)
+        # numeric variant: guard negative index
+        if j - 1 >= 0:
+            return Leg.basis(j + 1) - Leg.basis(j - 1)
+        else:
+            return Leg.basis(j + 1)
 
 
 class DirichletChebyshev(Composite, Chebyshev):
@@ -329,10 +436,23 @@ class DirichletChebyshev(Composite, Chebyshev):
 
 class NeumannChebyshev(Composite, Chebyshev):
     def __init__(self, N, domain=(-1, 1), bc=(0, 0), constraint=0):
-        raise NotImplementedError
+        Chebyshev.__init__(self, N, domain=domain)
+        # Neumann composite: use Neumann boundary and stencil that maps
+        # psi_i = Q_{i+1} - Q_{i-1} (missing terms are treated as zero)
+        self.B = Neumann(bc, domain, self.reference_domain)
+        # stencil offsets -1 and +1 over a total column count of N+3
+        self.S = sparse.diags((-1, 1), (-1, 1), shape=(N + 1, N + 3), format="csr")
 
     def basis_function(self, j, sympy=False):
-        raise NotImplementedError
+        # psi_j = Q_{j+1} - Q_{j-1} where Q_k are Chebyshev polynomials
+        if sympy:
+            # Return symbolic expression valid for symbolic j as well.
+            return sp.cos((j + 1) * sp.acos(x)) - sp.cos((j - 1) * sp.acos(x))
+        # numeric variant: guard negative index
+        if j - 1 >= 0:
+            return Cheb.basis(j + 1) - Cheb.basis(j - 1)
+        else:
+            return Cheb.basis(j + 1)
 
 
 class BasisFunction:
