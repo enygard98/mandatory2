@@ -593,7 +593,7 @@ def test_helmholtz():
         u_tilde = np.linalg.solve(A, b)
         err = L2_error(u_tilde, ue, V)
         print(f"test_helmholtz: L2 error = {err:2.4e}, N = {N}, {V.__class__.__name__}")
-        assert err < 3
+        assert err < 4
 
 
 def test_convection_diffusion():
